@@ -6,8 +6,15 @@ import android.util.Log
 import com.match3.helper.model.BoardState
 
 /**
- * 棋盘图像识别器
- * 通过颜色采样将屏幕截图转换为棋盘状态
+ * 高性能棋盘图像识别器 V2
+ * 优化点：
+ * 1. Bitmap.getPixels() 批量读取 → 零 JNI 调用
+ * 2. 整数 RGB 距离分类 → 无浮点运算
+ * 3. 预计算参考颜色（从真实截图提取）
+ * 4. 像素缓冲区复用 → 减少 GC
+ * 5. 5 点十字采样 + 加权投票
+ *
+ * 理论速度提升：约 50-100 倍（原方案每帧 ~150 次 JNI + 浮点运算）
  */
 class BoardRecognizer {
 
@@ -16,41 +23,25 @@ class BoardRecognizer {
         const val ROWS = 7
         const val COLS = 7
 
-        // HSV 颜色分类阈值（需要根据实际截图微调）
-        // 色相范围：0-360，饱和度：0-1，亮度：0-1
-        private val COLOR_PROFILES = listOf(
-            // 粉色/紫色六边形 - H约 280-330
-            GemProfile(BoardState.PINK, "粉", hMin = 260f, hMax = 340f, sMin = 0.3f, vMin = 0.4f),
-            // 绿色三角形 - H约 100-150
-            GemProfile(BoardState.GREEN, "绿", hMin = 90f, hMax = 160f, sMin = 0.3f, vMin = 0.4f),
-            // 黄色方形 - H约 40-70
-            GemProfile(BoardState.YELLOW, "黄", hMin = 30f, hMax = 75f, sMin = 0.3f, vMin = 0.5f),
-            // 蓝色圆形 - H约 190-240
-            GemProfile(BoardState.BLUE, "蓝", hMin = 175f, hMax = 255f, sMin = 0.3f, vMin = 0.4f),
-            // 红色水滴 - H约 0-20 或 340-360
-            GemProfile(BoardState.RED, "红", hMin = 330f, hMax = 360f, sMin = 0.3f, vMin = 0.4f, hMin2 = 0f, hMax2 = 25f),
+        /**
+         * 参考颜色（RGB），从真实游戏截图提取的平均值
+         * 顺序：PINK, GREEN, YELLOW, BLUE, RED
+         * 对应 type 值：1, 2, 3, 4, 5
+         */
+        private val REF_COLORS = arrayOf(
+            intArrayOf(227, 168, 236), // PINK (type=1)
+            intArrayOf(171, 239, 131), // GREEN (type=2)
+            intArrayOf(251, 244, 136), // YELLOW (type=3)
+            intArrayOf(101, 217, 234), // BLUE (type=4)
+            intArrayOf(246, 125, 113), // RED (type=5)
         )
+
+        // 背景阈值：RGB最大值 < 60 或 色差 < 15 视为背景/空白
+        private const val BG_MAX_THRESHOLD = 60
+        private const val BG_DIFF_THRESHOLD = 15
     }
 
-    data class GemProfile(
-        val type: Int,
-        val name: String,
-        val hMin: Float,
-        val hMax: Float,
-        val sMin: Float = 0.2f,
-        val vMin: Float = 0.3f,
-        val hMin2: Float = -1f,
-        val hMax2: Float = -1f
-    ) {
-        fun matches(h: Float, s: Float, v: Float): Boolean {
-            if (s < sMin || v < vMin) return false
-            val inRange1 = h in hMin..hMax
-            val inRange2 = if (hMin2 >= 0) h in hMin2..hMax2 else false
-            return inRange1 || inRange2
-        }
-    }
-
-    /** 棋盘区域（在屏幕上的绝对坐标） */
+    /** 棋盘区域（屏幕绝对坐标） */
     data class BoardRegion(
         val left: Int,
         val top: Int,
@@ -62,7 +53,6 @@ class BoardRecognizer {
         val cellWidth: Float get() = width.toFloat() / COLS
         val cellHeight: Float get() = height.toFloat() / ROWS
 
-        /** 获取某格子的中心坐标（屏幕绝对坐标） */
         fun getCellCenter(row: Int, col: Int): Pair<Float, Float> {
             val cx = left + col * cellWidth + cellWidth / 2f
             val cy = top + row * cellHeight + cellHeight / 2f
@@ -72,181 +62,320 @@ class BoardRecognizer {
 
     var boardRegion: BoardRegion? = null
 
+    // 像素缓冲区（复用，避免每帧 GC）
+    private var pixelBuffer: IntArray? = null
+    private var bufferRegionWidth: Int = 0
+
+    // 预计算的采样偏移（region 相对坐标）
+    // 形状：samples[row][col] = IntArray(5) = [中心, 上, 下, 左, 右] 的像素索引
+    private var sampleIndices: Array<Array<IntArray>>? = null
+
+    // 颜色校准数据（用户可动态更新）
+    private var calibratedColors: Array<IntArray> = REF_COLORS.copyOf()
+
     /**
      * 校准棋盘区域
-     * 用户框选棋盘左上角和右下角后调用
      */
     fun calibrate(left: Int, top: Int, right: Int, bottom: Int) {
-        boardRegion = BoardRegion(left, top, right, bottom)
-        Log.i(TAG, "棋盘已校准: $boardRegion")
+        val region = BoardRegion(left, top, right, bottom)
+        boardRegion = region
+        bufferRegionWidth = region.width
+
+        // 重新计算采样索引
+        precomputeSampleIndices(region)
+
+        // 分配/复用像素缓冲区
+        val bufferSize = region.width * region.height
+        if (pixelBuffer == null || pixelBuffer!!.size < bufferSize) {
+            pixelBuffer = IntArray(bufferSize)
+        }
+
+        Log.i(TAG, "棋盘已校准: $region, 采样点=${COLS * ROWS * 5}个")
     }
 
     /**
-     * 从截屏Bitmap中识别棋盘状态
+     * 使用当前截图自动校准颜色参考值
+     * 从棋盘区域提取每个格子的中心颜色，按类型聚类更新参考值
+     * 调用时机：校准棋盘后，或用户手动触发
      */
-    fun recognize(bitmap: Bitmap): BoardState? {
-        val region = boardRegion ?: return null
+    fun autoCalibrateColors(bitmap: Bitmap) {
+        val region = boardRegion ?: return
+        val w = region.width
+        val h = region.height
+        val pixels = IntArray(w * h)
+        bitmap.getPixels(pixels, 0, w, region.left, region.top, w, h)
 
-        val grid = Array(ROWS) { IntArray(COLS) }
+        val cellW = w / COLS.toFloat()
+        val cellH = h / ROWS.toFloat()
+
+        // 收集每种颜色的样本
+        val colorSamples = Array(5) { mutableListOf<IntArray>() }
 
         for (r in 0 until ROWS) {
             for (c in 0 until COLS) {
-                val (cx, cy) = region.getCellCenter(r, c)
-                val type = classifyCell(bitmap, cx.toInt(), cy.toInt(), region.cellWidth.toInt())
-                grid[r][c] = type
+                val cx = (c * cellW + cellW / 2).toInt()
+                val cy = (r * cellH + cellH / 2).toInt()
+                val px = pixels[cy * w + cx]
+
+                // 跳过背景
+                val rr = Color.red(px)
+                val gg = Color.green(px)
+                val bb = Color.blue(px)
+                if (maxOf(rr, gg, bb) < BG_MAX_THRESHOLD || maxOf(rr, gg, bb) - minOf(rr, gg, bb) < BG_DIFF_THRESHOLD) {
+                    continue
+                }
+
+                // 用当前参考颜色分类，归类样本
+                var bestType = -1
+                var bestDist = Int.MAX_VALUE
+                for (i in 0 until 5) {
+                    val ref = calibratedColors[i]
+                    val dist = (rr - ref[0]) * (rr - ref[0]) +
+                            (gg - ref[1]) * (gg - ref[1]) +
+                            (bb - ref[2]) * (bb - ref[2])
+                    if (dist < bestDist) {
+                        bestDist = dist
+                        bestType = i
+                    }
+                }
+
+                if (bestType >= 0) {
+                    colorSamples[bestType].add(intArrayOf(rr, gg, bb))
+                }
             }
         }
 
+        // 更新参考颜色为聚类平均值
+        for (i in 0 until 5) {
+            val samples = colorSamples[i]
+            if (samples.size >= 3) {
+                val avgR = samples.sumOf { it[0] } / samples.size
+                val avgG = samples.sumOf { it[1] } / samples.size
+                val avgB = samples.sumOf { it[2] } / samples.size
+                calibratedColors[i] = intArrayOf(avgR, avgG, avgB)
+                Log.i(TAG, "颜色校准 [${i+1}]: ${calibratedColors[i].contentToString()}, 样本数=${samples.size}")
+            }
+        }
+    }
+
+    /**
+     * 从截屏中识别棋盘状态
+     * 核心：一次性 getPixels() + 纯整数运算
+     */
+    fun recognize(bitmap: Bitmap): BoardState? {
+        val region = boardRegion ?: return null
+        val indices = sampleIndices ?: return null
+        val buffer = pixelBuffer ?: return null
+        val w = bufferRegionWidth
+
+        val startTime = System.nanoTime()
+
+        // 1. 一次性读取整个棋盘区域到缓冲区（仅 1 次 JNI 调用）
+        bitmap.getPixels(buffer, 0, w, region.left, region.top, region.width, region.height)
+
+        val grid = Array(ROWS) { IntArray(COLS) }
+
+        // 2. 遍历每个格子，用预计算索引采样 + 整数距离分类
+        for (r in 0 until ROWS) {
+            for (c in 0 until COLS) {
+                val idxs = indices[r][c]
+                val centerPixel = buffer[idxs[0]]
+
+                // 快速背景检查（中心点）
+                if (isBackground(centerPixel)) {
+                    grid[r][c] = BoardState.EMPTY
+                    continue
+                }
+
+                // 5 点采样投票
+                val votes = IntArray(5) // 索引 0=PINK, 1=GREEN, 2=YELLOW, 3=BLUE, 4=RED
+                for (s in 0 until idxs.size) {
+                    val px = buffer[idxs[s]]
+                    val typeIdx = classifyPixelInt(px) // 返回 0-4 的 type index
+                    if (typeIdx >= 0) votes[typeIdx]++
+                }
+
+                // 取票数最多的类型
+                var bestIdx = 0
+                var bestVotes = votes[0]
+                for (i in 1 until 5) {
+                    if (votes[i] > bestVotes) {
+                        bestVotes = votes[i]
+                        bestIdx = i
+                    }
+                }
+
+                // 如果票数不足（<2），退回到中心点最近邻
+                if (bestVotes < 2) {
+                    bestIdx = classifyPixelInt(centerPixel).coerceAtLeast(0)
+                }
+
+                grid[r][c] = bestIdx + 1 // 转换为 BoardState type (1-5)
+            }
+        }
+
+        val elapsed = (System.nanoTime() - startTime) / 1_000_000f
+        Log.i(TAG, "识别耗时: ${elapsed}ms")
+
         val board = BoardState(grid)
-        Log.i(TAG, "识别结果:\n$board")
+        Log.d(TAG, "识别结果:\n$board")
         return board
     }
 
-    /**
-     * 分类单个格子
-     * 在格子中心附近采样多个像素，用多数投票决定类型
-     */
-    private fun classifyCell(bitmap: Bitmap, cx: Int, cy: Int, cellSize: Int): Int {
-        val sampleRadius = (cellSize * 0.25f).toInt().coerceAtLeast(3)
-        val votes = mutableMapOf<Int, Int>()
+    // ==================== 内部高性能方法 ====================
 
-        // 九宫格采样中心区域
-        val offsets = listOf(0, -sampleRadius / 2, sampleRadius / 2)
-        for (dy in offsets) {
-            for (dx in offsets) {
-                val x = (cx + dx).coerceIn(0, bitmap.width - 1)
-                val y = (cy + dy).coerceIn(0, bitmap.height - 1)
-                val pixel = bitmap.getPixel(x, y)
-                val type = classifyPixel(pixel)
-                votes[type] = (votes[type] ?: 0) + 1
+    /**
+     * 预计算所有格子的采样像素索引
+     * 采样点：中心 + 十字形 4 点（上、下、左、右）
+     * 偏移距离：格子短边的 15%，最少 2 像素
+     */
+    private fun precomputeSampleIndices(region: BoardRegion) {
+        val w = region.width
+        val h = region.height
+        val cellW = w / COLS.toFloat()
+        val cellH = h / ROWS.toFloat()
+        val offset = (minOf(cellW, cellH) * 0.15f).toInt().coerceAtLeast(2)
+
+        val indices = Array(ROWS) { Array(COLS) { IntArray(5) } }
+
+        for (r in 0 until ROWS) {
+            for (c in 0 until COLS) {
+                val cx = (c * cellW + cellW / 2).toInt()
+                val cy = (r * cellH + cellH / 2).toInt()
+
+                // 确保采样点在边界内
+                val up = (cy - offset).coerceIn(0, h - 1)
+                val down = (cy + offset).coerceIn(0, h - 1)
+                val left = (cx - offset).coerceIn(0, w - 1)
+                val right = (cx + offset).coerceIn(0, w - 1)
+
+                indices[r][c] = intArrayOf(
+                    cy * w + cx,      // 中心
+                    up * w + cx,      // 上
+                    down * w + cx,    // 下
+                    cy * w + left,    // 左
+                    cy * w + right,   // 右
+                )
             }
         }
 
-        // 返回得票最多的类型
-        return votes.maxByOrNull { it.value }?.key ?: BoardState.EMPTY
+        sampleIndices = indices
+        Log.i(TAG, "预计算采样索引完成: ${ROWS * COLS} 格子 × 5 点")
     }
 
     /**
-     * 将单个像素分类为宝石类型
+     * 整数 RGB 距离分类
+     * 返回：类型索引 0=PINK, 1=GREEN, 2=YELLOW, 3=BLUE, 4=RED
+     * 如果像素太暗/太灰，返回 -1
      */
-    private fun classifyPixel(pixel: Int): Int {
-        val r = Color.red(pixel)
-        val g = Color.green(pixel)
-        val b = Color.blue(pixel)
+    private fun classifyPixelInt(pixel: Int): Int {
+        val r = (pixel shr 16) and 0xFF
+        val g = (pixel shr 8) and 0xFF
+        val b = pixel and 0xFF
 
-        val (h, s, v) = rgbToHsv(r, g, b)
-
-        // 先检查是否是背景色（太浅或太灰）
-        if (v < 0.25f || s < 0.15f) {
-            return BoardState.EMPTY
+        // 快速背景检查
+        val max = maxOf(r, g, b)
+        val min = minOf(r, g, b)
+        if (max < BG_MAX_THRESHOLD || max - min < BG_DIFF_THRESHOLD) {
+            return -1
         }
 
-        // 匹配颜色配置
-        for (profile in COLOR_PROFILES) {
-            if (profile.matches(h, s, v)) {
-                return profile.type
+        // 整数平方距离比较（无需 sqrt，避免浮点）
+        var bestIdx = 0
+        var bestDist = Int.MAX_VALUE
+
+        for (i in 0 until 5) {
+            val ref = calibratedColors[i]
+            val dr = r - ref[0]
+            val dg = g - ref[1]
+            val db = b - ref[2]
+            val dist = dr * dr + dg * dg + db * db
+            if (dist < bestDist) {
+                bestDist = dist
+                bestIdx = i
             }
         }
 
-        // 如果都没匹配上，根据最接近的色相来判断
-        return findClosestByHue(h, s, v)
+        return bestIdx
     }
 
     /**
-     * RGB转HSV
+     * 检查像素是否可能是背景
      */
-    private fun rgbToHsv(r: Int, g: Int, b: Int): Triple<Float, Float, Float> {
-        val rf = r / 255f
-        val gf = g / 255f
-        val bf = b / 255f
-
-        val max = maxOf(rf, gf, bf)
-        val min = minOf(rf, gf, bf)
-        val diff = max - min
-
-        val v = max
-        val s = if (max == 0f) 0f else diff / max
-
-        val h = when {
-            diff == 0f -> 0f
-            max == rf -> (60 * ((gf - bf) / diff) + 360) % 360
-            max == gf -> (60 * ((bf - rf) / diff) + 120)
-            else -> (60 * ((rf - gf) / diff) + 240)
-        }
-
-        return Triple(h, s, v)
+    private fun isBackground(pixel: Int): Boolean {
+        val r = (pixel shr 16) and 0xFF
+        val g = (pixel shr 8) and 0xFF
+        val b = pixel and 0xFF
+        val max = maxOf(r, g, b)
+        val min = minOf(r, g, b)
+        return max < BG_MAX_THRESHOLD || max - min < BG_DIFF_THRESHOLD
     }
 
     /**
-     * 根据色相找最接近的颜色类型
+     * 手动更新某种颜色的参考值
+     * 用于用户自定义颜色校准
      */
-    private fun findClosestByHue(h: Float, s: Float, v: Float): Int {
-        if (s < 0.15f || v < 0.25f) return BoardState.EMPTY
-
-        val hueDistances = COLOR_PROFILES.map { profile ->
-            val center = when {
-                profile.hMin2 >= 0 -> {
-                    // 红色有两个区间，取较近的中心
-                    val c1 = (profile.hMin + profile.hMax) / 2
-                    val c2 = (profile.hMin2 + profile.hMax2) / 2
-                    val d1 = hueDistance(h, c1)
-                    val d2 = hueDistance(h, c2)
-                    if (d1 < d2) c1 else c2
-                }
-                else -> (profile.hMin + profile.hMax) / 2
-            }
-            val dist = hueDistance(h, center)
-            profile.type to dist
+    fun setReferenceColor(type: Int, r: Int, g: Int, b: Int) {
+        val idx = when (type) {
+            BoardState.PINK -> 0
+            BoardState.GREEN -> 1
+            BoardState.YELLOW -> 2
+            BoardState.BLUE -> 3
+            BoardState.RED -> 4
+            else -> return
         }
-
-        return hueDistances.minByOrNull { it.second }?.first ?: BoardState.EMPTY
-    }
-
-    private fun hueDistance(a: Float, b: Float): Float {
-        val diff = kotlin.math.abs(a - b)
-        return minOf(diff, 360f - diff)
+        calibratedColors[idx] = intArrayOf(r, g, b)
+        Log.i(TAG, "手动设置参考颜色 [$type]: ($r, $g, $b)")
     }
 
     /**
-     * 自动检测棋盘区域（简化版：根据颜色特征找最密集的7x7网格区域）
-     * 用户不方便手动校准时可以用这个
+     * 获取当前参考颜色（用于调试/显示）
+     */
+    fun getReferenceColors(): Map<Int, IntArray> {
+        return mapOf(
+            BoardState.PINK to calibratedColors[0],
+            BoardState.GREEN to calibratedColors[1],
+            BoardState.YELLOW to calibratedColors[2],
+            BoardState.BLUE to calibratedColors[3],
+            BoardState.RED to calibratedColors[4],
+        )
+    }
+
+    /**
+     * 自动检测棋盘区域（简化版：基于颜色密度）
      */
     fun autoDetectBoard(bitmap: Bitmap): BoardRegion? {
         val width = bitmap.width
         val height = bitmap.height
+        val step = 8 // 大步长降采样扫描
 
-        // 扫描整个图片，找出可能的宝石区域
-        // 策略：找到宝石颜色密集分布的矩形区域
-        val gemPixels = mutableListOf<Pair<Int, Int>>()
+        var minX = width
+        var minY = height
+        var maxX = 0
+        var maxY = 0
+        var gemCount = 0
 
-        val step = 4 // 降采样加速
+        // 扫描整个图片找宝石像素
         for (y in 0 until height step step) {
             for (x in 0 until width step step) {
                 val pixel = bitmap.getPixel(x, y)
-                val type = classifyPixel(pixel)
-                if (type != BoardState.EMPTY) {
-                    gemPixels.add(Pair(x, y))
+                if (!isBackground(pixel)) {
+                    minX = minOf(minX, x)
+                    minY = minOf(minY, y)
+                    maxX = maxOf(maxX, x)
+                    maxY = maxOf(maxY, y)
+                    gemCount++
                 }
             }
         }
 
-        if (gemPixels.size < 20) {
+        if (gemCount < 20) {
             Log.w(TAG, "未检测到足够宝石像素")
             return null
         }
 
-        // 计算包围盒
-        val minX = gemPixels.minOf { it.first }
-        val maxX = gemPixels.maxOf { it.first }
-        val minY = gemPixels.minOf { it.second }
-        val maxY = gemPixels.maxOf { it.second }
-
-        // 估算格子大小：假设是7x7，平均分配
-        val estCellW = (maxX - minX) / COLS.toFloat()
-        val estCellH = (maxY - minY) / ROWS.toFloat()
-
-        // 稍微扩大一点边界
-        val padding = (estCellW * 0.1f).toInt()
+        // 稍微扩大边界
+        val padding = 8
         val region = BoardRegion(
             left = (minX - padding).coerceAtLeast(0),
             top = (minY - padding).coerceAtLeast(0),
@@ -254,7 +383,7 @@ class BoardRecognizer {
             bottom = (maxY + padding).coerceAtMost(height)
         )
 
-        boardRegion = region
+        calibrate(region.left, region.top, region.right, region.bottom)
         Log.i(TAG, "自动检测到棋盘: $region")
         return region
     }
