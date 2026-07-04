@@ -261,19 +261,33 @@ class GameAssistService : AccessibilityService() {
             return
         }
 
-        // 2. AI 计算最优走法
-        val bestMove = gameAI.findBestMove(board)
-        if (bestMove == null) {
-            Log.i(TAG, "未找到有效走法")
+        // 2. AI 综合决策（交换 / 道具）
+        val action = gameAI.findBestAction(board)
+        if (action == null) {
+            Log.i(TAG, "未找到有效行动")
             hintOverlay?.removeHint()
             return
         }
 
-        // 3. 显示提示
+        // 3. 根据行动类型显示不同提示
         val region = boardRecognizer.boardRegion
         if (region != null) {
-            hintOverlay?.showHint(bestMove.move, region)
-            Log.i(TAG, "提示: $bestMove")
+            when (action.type) {
+                GameAI.ActionType.SWAP -> {
+                    action.move?.let { move ->
+                        hintOverlay?.showSwapHint(move, region, action.reason)
+                        Log.i(TAG, "交换提示: ${action.reason} | $move")
+                    }
+                }
+                GameAI.ActionType.REFRESH -> {
+                    hintOverlay?.showRefreshHint(action.reason)
+                    Log.i(TAG, "道具提示: ${action.reason}")
+                }
+                GameAI.ActionType.HAMMER -> {
+                    hintOverlay?.showHammerHint(action.reason)
+                    Log.i(TAG, "道具提示: ${action.reason}")
+                }
+            }
         }
     }
 
