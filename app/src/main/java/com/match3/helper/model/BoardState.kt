@@ -10,10 +10,10 @@ package com.match3.helper.model
  *   3  = 黄色 (YELLOW)
  *   4  = 蓝色 (BLUE)
  *   5  = 红色 (RED)
- *   10 = 行火箭 (ROW_ROCKET) — 触发消除整行
- *   20 = 列火箭 (COL_ROCKET) — 触发消除整列
- *   30 = 炸弹 (BOMB) — 触发消除 3×3 范围
- *   40 = 彩虹球 (RAINBOW) — 与任意交换触发全屏/同色消除
+ *   10 = 行火箭 (ROW_ROCKET) — 被移动时触发消除整行
+ *   20 = 列火箭 (COL_ROCKET) — 被移动时触发消除整列
+ *   30 = 炸弹 (BOMB) — 被移动时触发消除 3×3 范围
+ *   40 = 彩虹球 (RAINBOW) — 与基础颜色交换时消除所有该颜色
  */
 class BoardState(val grid: Array<IntArray>) {
 
@@ -26,10 +26,10 @@ class BoardState(val grid: Array<IntArray>) {
         const val RED = 5
 
         // 特殊棋子
-        const val ROW_ROCKET = 10    // 行火箭：触发消除整行
-        const val COL_ROCKET = 20    // 列火箭：触发消除整列
-        const val BOMB = 30          // 炸弹：触发消除 3×3
-        const val RAINBOW = 40       // 彩虹球：与任意交换触发全屏/同色消除
+        const val ROW_ROCKET = 10    // 行火箭
+        const val COL_ROCKET = 20    // 列火箭
+        const val BOMB = 30          // 炸弹
+        const val RAINBOW = 40       // 彩虹球
 
         const val ROWS = 7
         const val COLS = 7
@@ -73,8 +73,20 @@ class BoardState(val grid: Array<IntArray>) {
         return dr + dc == 1
     }
 
+    /**
+     * 检查交换是否合法
+     * 特殊棋子：移动即触发，总是合法
+     * 普通棋子：交换后需形成 >=3 连消除
+     */
     fun canEliminateAfterSwap(pos1: Pair<Int, Int>, pos2: Pair<Int, Int>): Boolean {
         if (!isAdjacent(pos1, pos2)) return false
+        val t1 = this[pos1.first, pos1.second]
+        val t2 = this[pos2.first, pos2.second]
+
+        // 特殊棋子移动即触发，总是合法
+        if (isSpecialGem(t1) || isSpecialGem(t2)) return true
+
+        // 普通棋子检查交换后是否有消除
         val copy = this.copy()
         val temp = copy[pos1.first, pos1.second]
         copy[pos1.first, pos1.second] = copy[pos2.first, pos2.second]
@@ -82,26 +94,19 @@ class BoardState(val grid: Array<IntArray>) {
         return copy.findEliminations().isNotEmpty()
     }
 
-    // ==================== 核心消除逻辑 ====================
+    // ==================== 消除检测 ====================
 
-    /**
-     * 消除组信息，包含形状和类型
-     */
     data class ElimGroup(
         val cells: List<Pair<Int, Int>>,
-        val colorType: Int,       // 基础颜色 1-5
-        val direction: Direction, // HORIZONTAL, VERTICAL, L_SHAPE, T_SHAPE, CROSS
+        val colorType: Int,
+        val direction: Direction,
         val size: Int
     ) {
         enum class Direction { HORIZONTAL, VERTICAL, L_SHAPE, T_SHAPE, CROSS, LINE_4, LINE_5 }
     }
 
-    /**
-     * 找出所有消除组合，并识别形状
-     */
     fun findEliminations(): List<ElimGroup> {
         val groups = mutableListOf<ElimGroup>()
-        val visited = Array(ROWS) { BooleanArray(COLS) }
 
         // 扫描行
         for (r in 0 until ROWS) {
@@ -114,7 +119,6 @@ class BoardState(val grid: Array<IntArray>) {
                 val len = end - c
                 if (len >= 3) {
                     val cells = (c until end).map { Pair(r, it) }
-                    cells.forEach { visited[it.first][it.second] = true }
                     val dir = when (len) {
                         4 -> ElimGroup.Direction.LINE_4
                         5 -> ElimGroup.Direction.LINE_5
@@ -137,7 +141,6 @@ class BoardState(val grid: Array<IntArray>) {
                 val len = end - r
                 if (len >= 3) {
                     val cells = (r until end).map { Pair(it, c) }
-                    cells.forEach { visited[it.first][it.second] = true }
                     val dir = when (len) {
                         4 -> ElimGroup.Direction.LINE_4
                         5 -> ElimGroup.Direction.LINE_5
@@ -152,10 +155,15 @@ class BoardState(val grid: Array<IntArray>) {
         return groups
     }
 
-    // ==================== 模拟一次交换 ====================
+    // ==================== 交换模拟 ====================
 
     /**
-     * 模拟一次交换并执行消除（含特殊棋子、连锁、道具）
+     * 模拟一次交换并执行消除
+     *
+     * 核心规则：特殊棋子移动即触发
+     * - t1 被移动到 pos2 → t1 在 pos2 触发效果
+     * - t2 被移动到 pos1 → t2 在 pos1 触发效果
+     * - 两个都是特殊棋子 → 组合效果（覆盖单个效果）
      */
     fun simulateSwapAndEliminate(pos1: Pair<Int, Int>, pos2: Pair<Int, Int>): SwapResult {
         val copy = this.copy()
@@ -173,18 +181,75 @@ class BoardState(val grid: Array<IntArray>) {
         var bombs = 0
         var rainbows = 0
         var stepsGained = 0
-        var specialTriggers = 0       // 特殊棋子被触发次数
-        var comboDestroyed = 0        // 组合消除（火箭+火箭等）
+        var specialTriggers = 0
+        var comboDestroyed = 0
+        var specialTriggered = false
 
-        // 先检查是否是特殊棋子交换（最高优先级）
-        if (isSpecialGem(t1) || isSpecialGem(t2)) {
-            val specialScore = copy.triggerSpecialSwap(pos1, pos2, t1, t2)
-            totalScore += specialScore
-            specialTriggers++
-            chainCount++
+        // === 阶段1：特殊棋子触发（移动即触发）===
+        when {
+            isSpecialGem(t1) && isSpecialGem(t2) -> {
+                totalScore += copy.triggerSpecialCombo(pos1, pos2, t1, t2)
+                specialTriggers++
+                comboDestroyed++
+                specialTriggered = true
+            }
+            isSpecialGem(t1) -> {
+                // t1 被移动到了 pos2，在 pos2 触发
+                totalScore += copy.triggerSingleSpecial(pos2, t1, t2)
+                specialTriggers++
+                specialTriggered = true
+            }
+            isSpecialGem(t2) -> {
+                // t2 被移动到了 pos1，在 pos1 触发
+                totalScore += copy.triggerSingleSpecial(pos1, t2, t1)
+                specialTriggers++
+                specialTriggered = true
+            }
         }
 
-        // 连锁消除循环
+        // === 阶段2：普通消除（仅当没有特殊棋子触发时）===
+        if (!specialTriggered) {
+            val groups = copy.findEliminations()
+            if (groups.isNotEmpty()) {
+                chainCount++
+                val allEliminated = mutableSetOf<Pair<Int, Int>>()
+
+                for (group in groups) {
+                    allEliminated.addAll(group.cells)
+                    val count = group.cells.size
+                    totalScore += when (count) {
+                        3 -> 300
+                        4 -> 600
+                        else -> count * 150
+                    }
+                    if (count >= 4) stepsGained++
+
+                    when (group.direction) {
+                        ElimGroup.Direction.LINE_4 -> {
+                            val genPos = findGenerationPos(group, pos1, pos2)
+                            if (group.cells.all { it.first == group.cells[0].first }) {
+                                copy[genPos.first, genPos.second] = ROW_ROCKET
+                                rowRockets++
+                            } else {
+                                copy[genPos.first, genPos.second] = COL_ROCKET
+                                colRockets++
+                            }
+                        }
+                        ElimGroup.Direction.LINE_5 -> {
+                            val genPos = findGenerationPos(group, pos1, pos2)
+                            copy[genPos.first, genPos.second] = RAINBOW
+                            rainbows++
+                        }
+                        else -> { }
+                    }
+                }
+
+                allEliminated.forEach { (r, c) -> copy[r, c] = EMPTY }
+                copy.applyGravity()
+            }
+        }
+
+        // === 阶段3：连锁消除 ===
         while (true) {
             val groups = copy.findEliminations()
             if (groups.isEmpty()) break
@@ -192,64 +257,37 @@ class BoardState(val grid: Array<IntArray>) {
             chainCount++
             val allEliminated = mutableSetOf<Pair<Int, Int>>()
 
-            // 处理每个消除组
             for (group in groups) {
                 allEliminated.addAll(group.cells)
-
-                // 计分
                 val count = group.cells.size
                 totalScore += when (count) {
                     3 -> 300
                     4 -> 600
                     else -> count * 150
                 }
+                if (count >= 4) stepsGained++
 
-                // 4+ 消除 → 增加步数
-                if (count >= 4) {
-                    stepsGained++
-                }
-
-                // 根据形状生成特殊棋子（放在交换位置或组中心）
                 when (group.direction) {
                     ElimGroup.Direction.LINE_4 -> {
-                        // 4连：根据方向生成行/列火箭
                         val genPos = findGenerationPos(group, pos1, pos2)
-                        if (group.direction == ElimGroup.Direction.HORIZONTAL ||
-                            group.cells.all { it.first == group.cells[0].first }) {
-                            // 水平4连 → 行火箭
+                        if (group.cells.all { it.first == group.cells[0].first }) {
                             copy[genPos.first, genPos.second] = ROW_ROCKET
                             rowRockets++
                         } else {
-                            // 垂直4连 → 列火箭
                             copy[genPos.first, genPos.second] = COL_ROCKET
                             colRockets++
                         }
                     }
                     ElimGroup.Direction.LINE_5 -> {
-                        // 5连直线 → 彩虹球
                         val genPos = findGenerationPos(group, pos1, pos2)
                         copy[genPos.first, genPos.second] = RAINBOW
                         rainbows++
                     }
-                    else -> {
-                        // 检查是否是 L/T 形（5个，需要行+列交叉）
-                        // 简化：3连只计分，不生成特殊棋子
-                        // 实际游戏中 L/T 形需要额外检测，这里简化
-                    }
+                    else -> { }
                 }
             }
 
-            // 消除所有匹配的棋子
-            allEliminated.forEach { (r, c) ->
-                // 如果被消除的是特殊棋子，触发其效果
-                val gemType = copy[r, c]
-                if (isSpecialGem(gemType) && !allEliminated.contains(Pair(r, c))) {
-                    // 已在消除集中，效果已在上面处理
-                }
-                copy[r, c] = EMPTY
-            }
-
-            // 下落
+            allEliminated.forEach { (r, c) -> copy[r, c] = EMPTY }
             copy.applyGravity()
         }
 
@@ -267,18 +305,74 @@ class BoardState(val grid: Array<IntArray>) {
         )
     }
 
-    // ==================== 特殊棋子交换触发 ====================
+    // ==================== 特殊棋子触发 ====================
 
     /**
-     * 触发两个特殊棋子的交换效果
-     * 返回：这次特殊交换的得分
+     * 单个特殊棋子被移动时触发的效果
+     * @param pos 特殊棋子的新位置（交换后的位置）
+     * @param specialType 特殊棋子类型
+     * @param swappedType 被交换的另一个棋子类型
      */
-    private fun triggerSpecialSwap(pos1: Pair<Int, Int>, pos2: Pair<Int, Int>, t1: Int, t2: Int): Int {
+    private fun triggerSingleSpecial(pos: Pair<Int, Int>, specialType: Int, swappedType: Int): Int {
+        var score = 0
+        val (r, c) = pos
+
+        when (specialType) {
+            ROW_ROCKET -> {
+                for (cc in 0 until COLS) {
+                    if (grid[r][cc] != EMPTY) {
+                        grid[r][cc] = EMPTY
+                        score += 100
+                    }
+                }
+                score += 500
+            }
+            COL_ROCKET -> {
+                for (rr in 0 until ROWS) {
+                    if (grid[rr][c] != EMPTY) {
+                        grid[rr][c] = EMPTY
+                        score += 100
+                    }
+                }
+                score += 500
+            }
+            BOMB -> {
+                for (rr in (r - 1).coerceAtLeast(0)..(r + 1).coerceAtMost(ROWS - 1)) {
+                    for (cc in (c - 1).coerceAtLeast(0)..(c + 1).coerceAtMost(COLS - 1)) {
+                        if (grid[rr][cc] != EMPTY) {
+                            grid[rr][cc] = EMPTY
+                            score += 100
+                        }
+                    }
+                }
+                score += 800
+            }
+            RAINBOW -> {
+                if (isBaseGem(swappedType)) {
+                    for (rr in 0 until ROWS) {
+                        for (cc in 0 until COLS) {
+                            if (grid[rr][cc] == swappedType) {
+                                grid[rr][cc] = EMPTY
+                                score += 150
+                            }
+                        }
+                    }
+                    score += 2000
+                }
+                grid[r][c] = EMPTY
+            }
+        }
+
+        return score
+    }
+
+    /**
+     * 两个特殊棋子组合触发的效果
+     */
+    private fun triggerSpecialCombo(pos1: Pair<Int, Int>, pos2: Pair<Int, Int>, t1: Int, t2: Int): Int {
         var score = 0
 
-        // 组合效果矩阵
         when {
-            // 彩虹球 + 彩虹球 = 全屏消除
             t1 == RAINBOW && t2 == RAINBOW -> {
                 for (r in 0 until ROWS) {
                     for (c in 0 until COLS) {
@@ -290,7 +384,6 @@ class BoardState(val grid: Array<IntArray>) {
                 }
                 score += 5000
             }
-            // 彩虹球 + 基础颜色 = 消除所有该颜色
             t1 == RAINBOW && isBaseGem(t2) -> {
                 val targetColor = t2
                 for (r in 0 until ROWS) {
@@ -302,7 +395,6 @@ class BoardState(val grid: Array<IntArray>) {
                     }
                 }
                 score += 2000
-                // 彩虹球自身也消除
                 grid[pos1.first, pos1.second] = EMPTY
                 grid[pos2.first, pos2.second] = EMPTY
             }
@@ -320,11 +412,9 @@ class BoardState(val grid: Array<IntArray>) {
                 grid[pos1.first, pos1.second] = EMPTY
                 grid[pos2.first, pos2.second] = EMPTY
             }
-            // 火箭 + 火箭 = 十字消除（交换点为中心）
             isRocket(t1) && isRocket(t2) -> {
                 val cr = pos1.first
                 val cc = pos1.second
-                // 消除整行整列
                 for (c in 0 until COLS) {
                     if (grid[cr][c] != EMPTY) { grid[cr][c] = EMPTY; score += 100 }
                 }
@@ -333,10 +423,9 @@ class BoardState(val grid: Array<IntArray>) {
                 }
                 score += 1500
             }
-            // 火箭 + 炸弹 = 3行3列消除
             (isRocket(t1) && t2 == BOMB) || (t1 == BOMB && isRocket(t2)) -> {
                 val cr = pos1.first
-                val cc = pos1.first
+                val cc = pos1.second
                 for (r in (cr - 1).coerceAtLeast(0)..(cr + 1).coerceAtMost(ROWS - 1)) {
                     for (c in 0 until COLS) {
                         if (grid[r][c] != EMPTY) { grid[r][c] = EMPTY; score += 100 }
@@ -349,7 +438,6 @@ class BoardState(val grid: Array<IntArray>) {
                 }
                 score += 2500
             }
-            // 炸弹 + 炸弹 = 大范围消除
             t1 == BOMB && t2 == BOMB -> {
                 val cr = pos1.first
                 val cc = pos1.second
@@ -360,10 +448,7 @@ class BoardState(val grid: Array<IntArray>) {
                 }
                 score += 3000
             }
-            // 彩虹球 + 火箭/炸弹 = 所有该颜色变成对应特殊棋子并触发
             t1 == RAINBOW && isRocket(t2) -> {
-                // 随机选择一种颜色全部变成行火箭并触发
-                // 简化：消除所有基础颜色棋子
                 for (r in 0 until ROWS) {
                     for (c in 0 until COLS) {
                         if (isBaseGem(grid[r][c])) {
@@ -385,67 +470,13 @@ class BoardState(val grid: Array<IntArray>) {
                 }
                 score += 3500
             }
-            // 单个火箭触发
-            isRocket(t1) -> {
-                val cr = pos1.first
-                val cc = pos1.second
-                if (t1 == ROW_ROCKET) {
-                    for (c in 0 until COLS) {
-                        if (grid[cr][c] != EMPTY) { grid[cr][c] = EMPTY; score += 80 }
-                    }
-                } else {
-                    for (r in 0 until ROWS) {
-                        if (grid[r][cc] != EMPTY) { grid[r][cc] = EMPTY; score += 80 }
-                    }
-                }
-                score += 500
-            }
-            // 单个炸弹触发
-            t1 == BOMB -> {
-                val cr = pos1.first
-                val cc = pos1.second
-                for (r in (cr - 1).coerceAtLeast(0)..(cr + 1).coerceAtMost(ROWS - 1)) {
-                    for (c in (cc - 1).coerceAtLeast(0)..(cc + 1).coerceAtMost(COLS - 1)) {
-                        if (grid[r][c] != EMPTY) { grid[r][c] = EMPTY; score += 80 }
-                    }
-                }
-                score += 800
-            }
-            isRocket(t2) -> {
-                val cr = pos2.first
-                val cc = pos2.second
-                if (t2 == ROW_ROCKET) {
-                    for (c in 0 until COLS) {
-                        if (grid[cr][c] != EMPTY) { grid[cr][c] = EMPTY; score += 80 }
-                    }
-                } else {
-                    for (r in 0 until ROWS) {
-                        if (grid[r][cc] != EMPTY) { grid[r][cc] = EMPTY; score += 80 }
-                    }
-                }
-                score += 500
-            }
-            t2 == BOMB -> {
-                val cr = pos2.first
-                val cc = pos2.second
-                for (r in (cr - 1).coerceAtLeast(0)..(cr + 1).coerceAtMost(ROWS - 1)) {
-                    for (c in (cc - 1).coerceAtLeast(0)..(cc + 1).coerceAtMost(COLS - 1)) {
-                        if (grid[r][c] != EMPTY) { grid[r][c] = EMPTY; score += 80 }
-                    }
-                }
-                score += 800
-            }
         }
 
         return score
     }
 
-    // ==================== 道具模拟 ====================
+    // ==================== 道具 ====================
 
-    /**
-     * 模拟使用"刷新"道具：随机重排所有非空棋子
-     * 返回：刷新后的棋盘（随机）
-     */
     fun simulateRefresh(): BoardState {
         val copy = this.copy()
         val gems = mutableListOf<Int>()
@@ -468,18 +499,12 @@ class BoardState(val grid: Array<IntArray>) {
         return copy
     }
 
-    /**
-     * 模拟使用"锤击"道具：敲掉指定位置的棋子
-     * 返回：敲掉后的棋盘 + 连锁得分
-     */
     fun simulateHammer(row: Int, col: Int): HammerResult {
         val copy = this.copy()
         var score = 0
         var chainCount = 0
 
-        // 敲掉指定棋子
         if (copy[row, col] != EMPTY) {
-            // 如果敲掉的是特殊棋子，触发效果
             if (isSpecialGem(copy[row, col])) {
                 score += triggerSpecialAt(copy, row, col, copy[row, col])
             } else {
@@ -488,7 +513,6 @@ class BoardState(val grid: Array<IntArray>) {
             }
         }
 
-        // 下落并检查连锁
         copy.applyGravity()
 
         while (true) {
@@ -530,7 +554,6 @@ class BoardState(val grid: Array<IntArray>) {
                 score += 800
             }
             RAINBOW -> {
-                // 敲掉彩虹球：消除所有颜色最多的棋子
                 val colorCounts = IntArray(6)
                 for (r in 0 until ROWS) {
                     for (c in 0 until COLS) {
@@ -554,10 +577,9 @@ class BoardState(val grid: Array<IntArray>) {
         return score
     }
 
-    // ==================== 工具方法 ====================
+    // ==================== 工具 ====================
 
     private fun findGenerationPos(group: ElimGroup, swapPos1: Pair<Int, Int>, swapPos2: Pair<Int, Int>): Pair<Int, Int> {
-        // 优先放在交换位置，否则放组中心
         val swap1InGroup = group.cells.contains(swapPos1)
         val swap2InGroup = group.cells.contains(swapPos2)
         return when {
@@ -567,7 +589,6 @@ class BoardState(val grid: Array<IntArray>) {
         }
     }
 
-    /** 重力下落 */
     fun applyGravity() {
         for (c in 0 until COLS) {
             val nonEmpty = mutableListOf<Int>()
@@ -594,13 +615,13 @@ class BoardState(val grid: Array<IntArray>) {
     data class SwapResult(
         val score: Int,
         val chainCount: Int,
-        val rowRockets: Int,        // 生成行火箭数
-        val colRockets: Int,        // 生成列火箭数
-        val bombs: Int,             // 生成炸弹数
-        val rainbows: Int,          // 生成彩虹球数
-        val stepsGained: Int,       // 增加步数
-        val specialTriggers: Int,   // 特殊棋子触发次数
-        val comboDestroyed: Int,    // 组合消除次数
+        val rowRockets: Int,
+        val colRockets: Int,
+        val bombs: Int,
+        val rainbows: Int,
+        val stepsGained: Int,
+        val specialTriggers: Int,
+        val comboDestroyed: Int,
         val finalBoard: BoardState
     )
 
